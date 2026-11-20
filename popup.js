@@ -160,6 +160,11 @@ function handleExportAccounts() {
 function handleImportFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
+  if (file.size > 1_000_000) {
+    importFileInput.value = "";
+    showStatus("Fichier trop volumineux", "error");
+    return;
+  }
 
   const reader = new FileReader();
   reader.onload = (e) => {
