@@ -200,36 +200,54 @@ function deleteAccount(name) {
   });
 }
 
-// Exporter les profils en JSON
-function handleExportAccounts() {
-  chrome.storage.local.get(["sc_accounts"], (data) => {
-    const accounts = data.sc_accounts || {};
-    const keys = Object.keys(accounts);
+// Exporter les profils en JSON. Les cookies restent chiffrés : le fichier ne
+// s'ouvre qu'avec la passphrase du coffre (sel + témoin inclus dans "vault").
+async function handleExportAccounts() {
+  let data = await chrome.storage.local.get(["sc_accounts", "sc_vault"]);
+  if (Object.keys(data.sc_accounts || {}).length === 0) {
+    showStatus("Aucun profil à exporter", "error");
+    return;
+  }
 
-    if (keys.length === 0) {
-      showStatus("Aucun profil à exporter", "error");
-      return;
-    }
+  // Jamais d'export en clair : chiffrer d'abord les anciennes sessions.
+  const hasPlaintext = Object.values(data.sc_accounts).some((a) => !a?.secret);
+  if (!data.sc_vault || hasPlaintext) {
+    if (!(await unlockFlow())) return;
+    data = await chrome.storage.local.get(["sc_accounts", "sc_vault"]);
+  }
 
-    const payload = {
-      app: "SC_Account_Switcher",
-      version: "1.1.0",
-      exportedAt: new Date().toISOString(),
-      accounts: accounts
+  const accounts = {};
+  for (const [name, acc] of Object.entries(data.sc_accounts || {})) {
+    if (!acc?.secret) continue;
+    accounts[name] = {
+      name: acc.name,
+      username: acc.username,
+      avatarUrl: acc.avatarUrl,
+      permalinkUrl: acc.permalinkUrl,
+      secret: acc.secret,
+      savedAt: acc.savedAt
     };
+  }
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `soundcloud_switcher_backup_${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const payload = {
+    app: "SC_Account_Switcher",
+    version: chrome.runtime.getManifest().version,
+    exportedAt: new Date().toISOString(),
+    vault: data.sc_vault,
+    accounts
+  };
 
-    showStatus(`${keys.length} profil(s) exporté(s)`, "success");
-  });
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `soundcloud_switcher_backup_${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  showStatus(`${Object.keys(accounts).length} profil(s) exporté(s) (chiffré)`, "success");
 }
 
 // Importer des profils depuis un fichier JSON
@@ -253,7 +271,13 @@ function handleImportFile(event) {
       return;
     }
 
-    const res = await call({ action: "IMPORT_ACCOUNTS", file: data });
+    let passphrase = null;
+    if (data?.vault) {
+      passphrase = await askPassphrase({ title: "Passphrase du fichier de sauvegarde" });
+      if (passphrase === null) return;
+    }
+
+    const res = await call({ action: "IMPORT_ACCOUNTS", file: data, passphrase });
     if (res && res.success) {
       showStatus(`${res.count} compte(s) importé(s)`, "success");
       loadAccounts();

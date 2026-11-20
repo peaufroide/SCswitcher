@@ -84,6 +84,19 @@ const evilCookie = { name: "x", value: "1", domain: ".evilsoundcloud.com", path:
   assert.strictEqual(injected.value, TOKEN);
   assert.ok(injected.secure && injected.url.startsWith("https://"));
 
+  // Export (même format que la popup) : chiffré, réimportable avec la passphrase.
+  const local = chrome.storage.local.raw;
+  const backup = JSON.parse(JSON.stringify({ vault: local.sc_vault, accounts: local.sc_accounts }));
+  assert.ok(!JSON.stringify(backup).includes(TOKEN), "token en clair dans l'export");
+
+  await send({ action: "RESET_VAULT" });
+  await send({ action: "UNLOCK", passphrase: "another passphrase" });
+  assert.strictEqual((await send({ action: "IMPORT_ACCOUNTS", file: backup, passphrase: "nope" })).success, false);
+  assert.strictEqual((await send({ action: "IMPORT_ACCOUNTS", file: backup, passphrase: "correct horse" })).count, 1);
+  setCalls.length = 0;
+  assert.strictEqual((await send({ action: "SWITCH_ACCOUNT", accountName: "A" })).success, true);
+  assert.strictEqual(setCalls.find((c) => c.name === "oauth_token").value, TOKEN);
+
   // Import piégé (ancien format en clair) : cookies hors SoundCloud, avatar espion, __proto__.
   const evil = JSON.parse(JSON.stringify({
     accounts: {

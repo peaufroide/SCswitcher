@@ -142,7 +142,7 @@ const handlers = {
   CLEAN_LOGOUT: () => handleCleanLogout().then(() => ({ success: true })),
   SAVE_ACTIVE_ACCOUNT: (r) => handleManualSave(r.name),
   DELETE_ACCOUNT: (r) => handleDeleteAccount(r.name),
-  IMPORT_ACCOUNTS: (r) => handleImportAccounts(r.file),
+  IMPORT_ACCOUNTS: (r) => handleImportAccounts(r.file, r.passphrase),
   GET_CURRENT_SC_PROFILE: () => detectCurrentProfile(),
   GET_VAULT_STATE: () => getVaultState(),
   UNLOCK: (r) => handleUnlock(r.passphrase),
@@ -425,8 +425,9 @@ async function handleDeleteAccount(name) {
   return { success: true };
 }
 
-// Importation de comptes sauvegardés : rien n'est recopié tel quel, chaque
-// champ est validé, les cookies passent par sanitizeCookie puis sont chiffrés.
+// Importation de comptes sauvegardés.
+// Fichier chiffré (v1.2+) : déchiffré avec la passphrase du fichier.
+// Ancien fichier en clair (v1.1.0) : accepté pour migration, mais nettoyé.
 const MAX_IMPORT_ACCOUNTS = 50;
 const AVATAR_URL_RE = /^https:\/\/[a-z0-9-]+\.sndcdn\.com\//i;
 
@@ -435,11 +436,21 @@ function cleanText(value, max) {
   return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim().slice(0, max);
 }
 
-async function handleImportAccounts(file) {
+async function handleImportAccounts(file, passphrase) {
   const key = await requireKey();
   const imported = file?.accounts || file;
   if (!imported || typeof imported !== "object") {
     return { success: false, error: "Format de fichier invalide." };
+  }
+
+  let fileKey = null;
+  if (file.vault) {
+    try {
+      fileKey = await deriveKey(String(passphrase || ""), fromB64(file.vault.salt));
+      await decryptJson(fileKey, file.vault.check);
+    } catch {
+      return { success: false, error: "Passphrase du fichier incorrecte." };
+    }
   }
 
   const data = await chrome.storage.local.get(["sc_accounts"]);
@@ -449,9 +460,17 @@ async function handleImportAccounts(file) {
   let count = 0;
   for (const acc of Object.values(imported).slice(0, MAX_IMPORT_ACCOUNTS)) {
     const name = cleanText(acc?.name, 50);
-    if (!name || name === "__proto__" || !Array.isArray(acc.cookies)) continue;
+    if (!name || name === "__proto__") continue;
 
-    const cookies = acc.cookies.slice(0, MAX_COOKIES_PER_ACCOUNT).map(sanitizeCookie).filter(Boolean);
+    let rawCookies;
+    try {
+      rawCookies = acc.secret && fileKey ? await decryptJson(fileKey, acc.secret) : acc.cookies;
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(rawCookies)) continue;
+
+    const cookies = rawCookies.slice(0, MAX_COOKIES_PER_ACCOUNT).map(sanitizeCookie).filter(Boolean);
     if (!hasSoundcloudAuthCookie(cookies)) continue;
 
     existing[name] = {
