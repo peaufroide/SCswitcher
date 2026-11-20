@@ -9,11 +9,93 @@ const cleanLogoutBtn = document.getElementById("cleanLogoutBtn");
 const exportBtn = document.getElementById("exportBtn");
 const importBtn = document.getElementById("importBtn");
 const importFileInput = document.getElementById("importFileInput");
+const passDialog = document.getElementById("passDialog");
+const passForm = document.getElementById("passForm");
+const passTitle = document.getElementById("passTitle");
+const passInput = document.getElementById("passInput");
+const passConfirm = document.getElementById("passConfirm");
+const passError = document.getElementById("passError");
+const passReset = document.getElementById("passReset");
+
+const LOCKED = "LOCKED";
+const MAX_IMPORT_BYTES = 1_000_000;
+
+// --- Coffre chiffré : passphrase -------------------------------------------
+
+// Ouvre la boîte de dialogue ; résout avec la passphrase, ou null si annulé.
+function askPassphrase({ title, create = false, allowReset = false, error = "" }) {
+  return new Promise((resolve) => {
+    passTitle.textContent = title;
+    passError.textContent = error;
+    passInput.value = "";
+    passConfirm.value = "";
+    passInput.minLength = create ? 8 : 0;
+    passInput.autocomplete = create ? "new-password" : "current-password";
+    passConfirm.hidden = !create;
+    passConfirm.required = create;
+    passReset.hidden = !allowReset;
+    passDialog.returnValue = "";
+    passDialog.onclose = () => resolve(passDialog.returnValue === "ok" ? passInput.value : null);
+    passDialog.showModal();
+  });
+}
+
+passForm.addEventListener("submit", (e) => {
+  if (e.submitter?.value === "ok" && !passConfirm.hidden && passInput.value !== passConfirm.value) {
+    e.preventDefault();
+    passError.textContent = "Les passphrases ne correspondent pas";
+  }
+});
+
+passReset.addEventListener("click", async () => {
+  if (!confirm("Supprimer tous les comptes enregistrés et la passphrase ? Cette action est définitive.")) return;
+  await chrome.runtime.sendMessage({ action: "RESET_VAULT" });
+  passDialog.close("cancel");
+  showStatus("Coffre réinitialisé", "success");
+  loadAccounts();
+});
+
+// Déverrouille (ou crée) le coffre. Renvoie true si c'est fait.
+async function unlockFlow() {
+  const state = await chrome.runtime.sendMessage({ action: "GET_VAULT_STATE" });
+  if (state?.unlocked) return true;
+
+  let error = "";
+  for (;;) {
+    const passphrase = await askPassphrase(state?.hasVault
+      ? { title: "Passphrase pour déverrouiller vos sessions", allowReset: true, error }
+      : { title: "Choisissez une passphrase (8 car. min.) pour chiffrer vos sessions. Elle ne peut pas être récupérée.", create: true, error });
+    if (passphrase === null) return false;
+
+    const res = await chrome.runtime.sendMessage({ action: "UNLOCK", passphrase });
+    if (res?.success) return true;
+    error = res?.error || "Erreur de déverrouillage";
+  }
+}
+
+// Envoie un message au background ; si le coffre est verrouillé, demande la
+// passphrase puis relance une fois.
+async function call(message) {
+  let res = await chrome.runtime.sendMessage(message);
+  if (res?.error === LOCKED && await unlockFlow()) {
+    res = await chrome.runtime.sendMessage(message);
+  }
+  return res;
+}
+
+function errorText(res, fallback) {
+  if (res?.error === LOCKED) return "Sessions verrouillées";
+  return res?.error || fallback;
+}
 
 // Initialisation de la popup
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   loadAccounts();
   checkCurrentSoundCloudSession();
+
+  // Anciennes sessions stockées en clair (v1.1.0) : chiffrer au plus vite.
+  const state = await chrome.runtime.sendMessage({ action: "GET_VAULT_STATE" });
+  if (state?.hasLegacy) unlockFlow().then(loadAccounts);
 
   saveBtn.addEventListener("click", handleSaveAccount);
   accountNameInput.addEventListener("keydown", (e) => {
@@ -77,17 +159,14 @@ function handleSaveAccount() {
   saveBtn.disabled = true;
   showStatus("Détection du profil SoundCloud...", "info");
 
-  chrome.runtime.sendMessage({
-    action: "SAVE_ACTIVE_ACCOUNT",
-    name: sanitizedName
-  }, (response) => {
+  call({ action: "SAVE_ACTIVE_ACCOUNT", name: sanitizedName }).then((response) => {
     saveBtn.disabled = false;
     if (response && response.success) {
       accountNameInput.value = "";
       showStatus(`Compte "${response.name}" enregistré`, "success");
       loadAccounts();
     } else {
-      showStatus(response?.error || "Erreur lors de la sauvegarde", "error");
+      showStatus(errorText(response, "Erreur lors de la sauvegarde"), "error");
     }
   });
 }
@@ -96,15 +175,12 @@ function handleSaveAccount() {
 function switchToAccount(name) {
   showStatus(`Bascule vers "${name}"...`, "info");
 
-  chrome.runtime.sendMessage({
-    action: "SWITCH_ACCOUNT",
-    accountName: name
-  }, (response) => {
+  call({ action: "SWITCH_ACCOUNT", accountName: name }).then((response) => {
     if (response && response.success) {
       showStatus(`Actif : ${name}`, "success");
       loadAccounts();
     } else {
-      showStatus(response?.error || "Erreur lors de la bascule", "error");
+      showStatus(errorText(response, "Erreur lors de la bascule"), "error");
     }
   });
 }
@@ -124,65 +200,90 @@ function deleteAccount(name) {
   });
 }
 
-// Exporter les profils en JSON
-function handleExportAccounts() {
-  chrome.storage.local.get(["sc_accounts"], (data) => {
-    const accounts = data.sc_accounts || {};
-    const keys = Object.keys(accounts);
+// Exporter les profils en JSON. Les cookies restent chiffrés : le fichier ne
+// s'ouvre qu'avec la passphrase du coffre (sel + témoin inclus dans "vault").
+async function handleExportAccounts() {
+  let data = await chrome.storage.local.get(["sc_accounts", "sc_vault"]);
+  if (Object.keys(data.sc_accounts || {}).length === 0) {
+    showStatus("Aucun profil à exporter", "error");
+    return;
+  }
 
-    if (keys.length === 0) {
-      showStatus("Aucun profil à exporter", "error");
-      return;
-    }
+  // Jamais d'export en clair : chiffrer d'abord les anciennes sessions.
+  const hasPlaintext = Object.values(data.sc_accounts).some((a) => !a?.secret);
+  if (!data.sc_vault || hasPlaintext) {
+    if (!(await unlockFlow())) return;
+    data = await chrome.storage.local.get(["sc_accounts", "sc_vault"]);
+  }
 
-    const payload = {
-      app: "SC_Account_Switcher",
-      version: "1.1.0",
-      exportedAt: new Date().toISOString(),
-      accounts: accounts
+  const accounts = {};
+  for (const [name, acc] of Object.entries(data.sc_accounts || {})) {
+    if (!acc?.secret) continue;
+    accounts[name] = {
+      name: acc.name,
+      username: acc.username,
+      avatarUrl: acc.avatarUrl,
+      permalinkUrl: acc.permalinkUrl,
+      secret: acc.secret,
+      savedAt: acc.savedAt
     };
+  }
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `soundcloud_switcher_backup_${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const payload = {
+    app: "SC_Account_Switcher",
+    version: chrome.runtime.getManifest().version,
+    exportedAt: new Date().toISOString(),
+    vault: data.sc_vault,
+    accounts
+  };
 
-    showStatus(`${keys.length} profil(s) exporté(s)`, "success");
-  });
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `soundcloud_switcher_backup_${new Date().toISOString().slice(0, 10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  showStatus(`${Object.keys(accounts).length} profil(s) exporté(s) (chiffré)`, "success");
 }
 
 // Importer des profils depuis un fichier JSON
 function handleImportFile(event) {
   const file = event.target.files?.[0];
+  // Réinitialiser le file input pour permettre une réimportation si besoin
+  importFileInput.value = "";
   if (!file) return;
+  if (file.size > MAX_IMPORT_BYTES) {
+    showStatus("Fichier trop volumineux", "error");
+    return;
+  }
 
   const reader = new FileReader();
-  reader.onload = (e) => {
+  reader.onload = async (e) => {
+    let data;
     try {
-      const data = JSON.parse(e.target.result);
-      const accounts = data.accounts || data;
-
-      chrome.runtime.sendMessage({
-        action: "IMPORT_ACCOUNTS",
-        accounts: accounts
-      }, (res) => {
-        if (res && res.success) {
-          showStatus(`${res.count} compte(s) importé(s)`, "success");
-          loadAccounts();
-        } else {
-          showStatus(res?.error || "Format de fichier invalide", "error");
-        }
-      });
+      data = JSON.parse(e.target.result);
     } catch (err) {
       showStatus("Fichier JSON non valide", "error");
+      return;
     }
-    // Réinitialiser le file input pour permettre une réimportation si besoin
-    importFileInput.value = "";
+
+    let passphrase = null;
+    if (data?.vault) {
+      passphrase = await askPassphrase({ title: "Passphrase du fichier de sauvegarde" });
+      if (passphrase === null) return;
+    }
+
+    const res = await call({ action: "IMPORT_ACCOUNTS", file: data, passphrase });
+    if (res && res.success) {
+      showStatus(`${res.count} compte(s) importé(s)`, "success");
+      loadAccounts();
+    } else {
+      showStatus(errorText(res, "Format de fichier invalide"), "error");
+    }
   };
   reader.readAsText(file);
 }

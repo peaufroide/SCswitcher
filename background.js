@@ -9,6 +9,124 @@ const SOUNDCLOUD_DOMAINS = [
 // Verrou pour éviter les boucles d'auto-sauvegarde pendant les transactions
 let isSwitching = false;
 
+// ---------------------------------------------------------------------------
+// 0. COFFRE CHIFFRÉ
+// Les cookies de chaque compte sont chiffrés (AES-GCM 256) avec une clé dérivée
+// de la passphrase (PBKDF2-SHA256). La clé ne vit que dans chrome.storage.session
+// (mémoire, effacée à la fermeture du navigateur) : sur disque, rien d'exploitable.
+// ---------------------------------------------------------------------------
+const LOCKED = "LOCKED";
+const VAULT_CHECK = "sc-switcher-vault-v1";
+const PBKDF2_ITERATIONS = 600000;
+const MIN_PASSPHRASE = 8;
+const utf8 = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+
+function toB64(buf) {
+  let s = "";
+  for (const b of new Uint8Array(buf)) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function fromB64(s) {
+  return Uint8Array.from(atob(String(s)), (c) => c.charCodeAt(0));
+}
+
+async function deriveKey(passphrase, salt) {
+  const base = await crypto.subtle.importKey("raw", utf8.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    base,
+    { name: "AES-GCM", length: 256 },
+    true,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptJson(key, value) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, utf8.encode(JSON.stringify(value)));
+  return { iv: toB64(iv), ct: toB64(ct) };
+}
+
+async function decryptJson(key, box) {
+  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(box.iv) }, key, fromB64(box.ct));
+  return JSON.parse(utf8Decoder.decode(pt));
+}
+
+async function getSessionKey() {
+  const { sc_key } = await chrome.storage.session.get("sc_key");
+  if (!sc_key) return null;
+  return crypto.subtle.importKey("raw", fromB64(sc_key), "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
+async function requireKey() {
+  const key = await getSessionKey();
+  if (!key) throw new Error(LOCKED);
+  return key;
+}
+
+async function getVaultState() {
+  const { sc_vault, sc_accounts = {} } = await chrome.storage.local.get(["sc_vault", "sc_accounts"]);
+  return {
+    success: true,
+    hasVault: Boolean(sc_vault),
+    unlocked: Boolean(await getSessionKey()),
+    hasLegacy: Object.values(sc_accounts).some((a) => Array.isArray(a?.cookies))
+  };
+}
+
+// Déverrouille le coffre (ou le crée au premier usage) et migre les anciens
+// comptes stockés en clair (v1.1.0).
+async function handleUnlock(passphrase) {
+  if (typeof passphrase !== "string" || !passphrase) {
+    return { success: false, error: "Passphrase requise." };
+  }
+
+  const { sc_vault, sc_accounts = {} } = await chrome.storage.local.get(["sc_vault", "sc_accounts"]);
+  let key;
+
+  if (sc_vault) {
+    key = await deriveKey(passphrase, fromB64(sc_vault.salt));
+    try {
+      await decryptJson(key, sc_vault.check);
+    } catch {
+      return { success: false, error: "Passphrase incorrecte." };
+    }
+  } else {
+    if (passphrase.length < MIN_PASSPHRASE) {
+      return { success: false, error: `Passphrase trop courte (${MIN_PASSPHRASE} caractères min.).` };
+    }
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    key = await deriveKey(passphrase, salt);
+    await chrome.storage.local.set({
+      sc_vault: { salt: toB64(salt), check: await encryptJson(key, VAULT_CHECK) }
+    });
+  }
+
+  await chrome.storage.session.set({ sc_key: toB64(await crypto.subtle.exportKey("raw", key)) });
+
+  let migrated = false;
+  for (const acc of Object.values(sc_accounts)) {
+    if (Array.isArray(acc?.cookies)) {
+      acc.secret = await encryptJson(key, acc.cookies.map(sanitizeCookie).filter(Boolean));
+      delete acc.cookies;
+      migrated = true;
+    }
+  }
+  if (migrated) await chrome.storage.local.set({ sc_accounts });
+
+  return { success: true };
+}
+
+// Passphrase oubliée : seule issue, tout effacer.
+async function handleResetVault() {
+  await chrome.storage.local.remove(["sc_vault", "sc_accounts", "sc_active_account"]);
+  await chrome.storage.session.remove("sc_key");
+  await updateExtensionBadge();
+  return { success: true };
+}
+
 // Initialisation au démarrage
 chrome.runtime.onInstalled.addListener(() => {
   updateExtensionBadge();
@@ -19,60 +137,27 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 // 1. ÉCOUTEUR DE MESSAGES POPUP
+const handlers = {
+  SWITCH_ACCOUNT: (r) => handleSwitchAccount(r.accountName).then(() => ({ success: true })),
+  CLEAN_LOGOUT: () => handleCleanLogout().then(() => ({ success: true })),
+  SAVE_ACTIVE_ACCOUNT: (r) => handleManualSave(r.name),
+  DELETE_ACCOUNT: (r) => handleDeleteAccount(r.name),
+  IMPORT_ACCOUNTS: (r) => handleImportAccounts(r.file, r.passphrase),
+  GET_CURRENT_SC_PROFILE: () => detectCurrentProfile(),
+  GET_VAULT_STATE: () => getVaultState(),
+  UNLOCK: (r) => handleUnlock(r.passphrase),
+  RESET_VAULT: () => handleResetVault()
+};
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "SWITCH_ACCOUNT") {
-    handleSwitchAccount(request.accountName).then(() => {
-      sendResponse({ success: true });
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
-  
-  if (request.action === "CLEAN_LOGOUT") {
-    handleCleanLogout().then(() => {
-      sendResponse({ success: true });
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
+  // Uniquement nos propres pages (popup), jamais un onglet / content script.
+  if (sender.id !== chrome.runtime.id || sender.tab) return;
+  if (!request || !Object.hasOwn(handlers, request.action)) return;
 
-  if (request.action === "SAVE_ACTIVE_ACCOUNT") {
-    handleManualSave(request.name).then((res) => {
-      sendResponse(res);
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
-
-  if (request.action === "DELETE_ACCOUNT") {
-    handleDeleteAccount(request.name).then((res) => {
-      sendResponse(res);
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
-
-  if (request.action === "IMPORT_ACCOUNTS") {
-    handleImportAccounts(request.accounts).then((res) => {
-      sendResponse(res);
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
-
-  if (request.action === "GET_CURRENT_SC_PROFILE") {
-    detectCurrentProfile().then((res) => {
-      sendResponse(res);
-    }).catch((err) => {
-      sendResponse({ success: false, error: err.message || err.toString() });
-    });
-    return true;
-  }
+  handlers[request.action](request).then(sendResponse, (err) => {
+    sendResponse({ success: false, error: err?.message || String(err) });
+  });
+  return true;
 });
 
 // 2. AUTO-SYNC EN TEMPS RÉEL
@@ -93,14 +178,18 @@ function debouncedSyncActiveAccount() {
   syncTimeout = setTimeout(async () => {
     if (isSwitching) return;
     try {
+      const key = await getSessionKey();
+      if (!key) return; // Coffre verrouillé : impossible de chiffrer, on attend.
+
       const data = await chrome.storage.local.get(["sc_active_account", "sc_accounts"]);
       const activeName = data.sc_active_account;
       const accounts = data.sc_accounts || {};
 
-      if (activeName && accounts[activeName]) {
+      if (activeName && Object.hasOwn(accounts, activeName)) {
         const freshCookies = await getSoundcloudCookies();
         if (hasSoundcloudAuthCookie(freshCookies)) {
-          accounts[activeName].cookies = freshCookies;
+          accounts[activeName].secret = await encryptJson(key, freshCookies.map(sanitizeCookie).filter(Boolean));
+          delete accounts[activeName].cookies;
           accounts[activeName].lastSynced = new Date().toISOString();
           await chrome.storage.local.set({ sc_accounts: accounts });
         }
@@ -170,6 +259,39 @@ async function updateExtensionBadge() {
 }
 
 // 5. GESTION DES COOKIES
+const COOKIE_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
+const UNSAFE_COOKIE_CHARS = /[\u0000-\u001F\u007F;]/;
+const SAME_SITE_VALUES = ["no_restriction", "lax", "strict"];
+const MAX_COOKIES_PER_ACCOUNT = 100;
+
+function isSoundcloudDomain(domain) {
+  const d = String(domain).replace(/^\./, "").toLowerCase();
+  return d === "soundcloud.com" || d.endsWith(".soundcloud.com");
+}
+
+// Seul format de cookie accepté avant injection dans le navigateur : domaine
+// SoundCloud uniquement, Secure forcé, champs reconstruits (rien n'est recopié tel quel).
+function sanitizeCookie(c) {
+  if (!c || typeof c !== "object") return null;
+  if (typeof c.name !== "string" || !COOKIE_NAME_RE.test(c.name)) return null;
+  if (typeof c.value !== "string" || c.value.length > 4096 || UNSAFE_COOKIE_CHARS.test(c.value)) return null;
+  if (typeof c.domain !== "string" || !isSoundcloudDomain(c.domain)) return null;
+
+  const pathOk = typeof c.path === "string" && c.path.startsWith("/") && c.path.length <= 1024 && !UNSAFE_COOKIE_CHARS.test(c.path);
+  const cookie = {
+    name: c.name,
+    value: c.value,
+    domain: c.domain.toLowerCase(),
+    path: pathOk ? c.path : "/",
+    secure: true,
+    httpOnly: c.httpOnly === true,
+    hostOnly: c.hostOnly === true
+  };
+  if (SAME_SITE_VALUES.includes(c.sameSite)) cookie.sameSite = c.sameSite;
+  if (Number.isFinite(c.expirationDate)) cookie.expirationDate = c.expirationDate;
+  return cookie;
+}
+
 function hasSoundcloudAuthCookie(cookies) {
   if (!Array.isArray(cookies) || cookies.length === 0) return false;
   return cookies.some(c => c.name === "oauth_token" && typeof c.value === "string" && c.value.trim().length > 0);
@@ -211,35 +333,23 @@ async function clearSoundcloudCookies() {
 }
 
 async function setSoundcloudCookies(cookies) {
-  for (const cookie of cookies) {
-    const cleanDomain = cookie.domain.startsWith(".") ? cookie.domain.substring(1) : cookie.domain;
-    const protocol = cookie.secure ? "https:" : "http:";
-    const url = `${protocol}//${cleanDomain}${cookie.path}`;
+  for (const raw of cookies) {
+    const cookie = sanitizeCookie(raw);
+    if (!cookie) continue;
 
+    const host = cookie.domain.replace(/^\./, "");
     const cookieDetails = {
-      url: url,
+      url: `https://${host}${cookie.path}`,
       name: cookie.name,
       value: cookie.value,
-      path: cookie.path || "/",
-      secure: cookie.secure !== undefined ? cookie.secure : true,
-      httpOnly: Boolean(cookie.httpOnly)
+      path: cookie.path,
+      secure: true,
+      httpOnly: cookie.httpOnly
     };
 
-    if (!cookie.hostOnly && cookie.domain) {
-      cookieDetails.domain = cookie.domain;
-    }
-
-    if (cookie.storeId) {
-      cookieDetails.storeId = cookie.storeId;
-    }
-
-    if (cookie.sameSite && cookie.sameSite !== "unspecified") {
-      cookieDetails.sameSite = cookie.sameSite;
-    }
-
-    if (cookie.expirationDate) {
-      cookieDetails.expirationDate = cookie.expirationDate;
-    }
+    if (!cookie.hostOnly) cookieDetails.domain = cookie.domain;
+    if (cookie.sameSite) cookieDetails.sameSite = cookie.sameSite;
+    if (cookie.expirationDate) cookieDetails.expirationDate = cookie.expirationDate;
 
     try {
       await chrome.cookies.set(cookieDetails);
@@ -253,11 +363,12 @@ async function setSoundcloudCookies(cookies) {
 
 // Sauvegarde manuelle ou auto-détectée d'un profil
 async function handleManualSave(preferredName) {
+  const key = await requireKey();
   const cookies = await getSoundcloudCookies();
   if (!hasSoundcloudAuthCookie(cookies)) {
-    return { 
-      success: false, 
-      error: "Aucune session active détectée. Connectez-vous d'abord sur SoundCloud." 
+    return {
+      success: false,
+      error: "Aucune session active détectée. Connectez-vous d'abord sur SoundCloud."
     };
   }
 
@@ -269,7 +380,7 @@ async function handleManualSave(preferredName) {
   if (!finalName && profile && profile.username) {
     finalName = profile.username;
   }
-  if (!finalName) {
+  if (!finalName || finalName === "__proto__") {
     finalName = "Compte SoundCloud";
   }
 
@@ -281,7 +392,7 @@ async function handleManualSave(preferredName) {
     username: profile?.username || finalName,
     avatarUrl: profile?.avatarUrl || null,
     permalinkUrl: profile?.permalinkUrl || null,
-    cookies: cookies,
+    secret: await encryptJson(key, cookies.map(sanitizeCookie).filter(Boolean)),
     savedAt: new Date().toISOString(),
     lastSynced: new Date().toISOString()
   };
@@ -314,21 +425,64 @@ async function handleDeleteAccount(name) {
   return { success: true };
 }
 
-// Importation de comptes sauvegardés
-async function handleImportAccounts(importedAccounts) {
-  if (!importedAccounts || typeof importedAccounts !== "object") {
+// Importation de comptes sauvegardés.
+// Fichier chiffré (v1.2+) : déchiffré avec la passphrase du fichier.
+// Ancien fichier en clair (v1.1.0) : accepté pour migration, mais nettoyé.
+const MAX_IMPORT_ACCOUNTS = 50;
+const AVATAR_URL_RE = /^https:\/\/[a-z0-9-]+\.sndcdn\.com\//i;
+
+function cleanText(value, max) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim().slice(0, max);
+}
+
+async function handleImportAccounts(file, passphrase) {
+  const key = await requireKey();
+  const imported = file?.accounts || file;
+  if (!imported || typeof imported !== "object") {
     return { success: false, error: "Format de fichier invalide." };
+  }
+
+  let fileKey = null;
+  if (file.vault) {
+    try {
+      fileKey = await deriveKey(String(passphrase || ""), fromB64(file.vault.salt));
+      await decryptJson(fileKey, file.vault.check);
+    } catch {
+      return { success: false, error: "Passphrase du fichier incorrecte." };
+    }
   }
 
   const data = await chrome.storage.local.get(["sc_accounts"]);
   const existing = data.sc_accounts || {};
+  const now = new Date().toISOString();
 
   let count = 0;
-  for (const [key, acc] of Object.entries(importedAccounts)) {
-    if (acc && acc.name && Array.isArray(acc.cookies) && hasSoundcloudAuthCookie(acc.cookies)) {
-      existing[acc.name] = acc;
-      count++;
+  for (const acc of Object.values(imported).slice(0, MAX_IMPORT_ACCOUNTS)) {
+    const name = cleanText(acc?.name, 50);
+    if (!name || name === "__proto__") continue;
+
+    let rawCookies;
+    try {
+      rawCookies = acc.secret && fileKey ? await decryptJson(fileKey, acc.secret) : acc.cookies;
+    } catch {
+      continue;
     }
+    if (!Array.isArray(rawCookies)) continue;
+
+    const cookies = rawCookies.slice(0, MAX_COOKIES_PER_ACCOUNT).map(sanitizeCookie).filter(Boolean);
+    if (!hasSoundcloudAuthCookie(cookies)) continue;
+
+    existing[name] = {
+      name,
+      username: cleanText(acc.username, 50) || name,
+      avatarUrl: typeof acc.avatarUrl === "string" && AVATAR_URL_RE.test(acc.avatarUrl) ? acc.avatarUrl : null,
+      permalinkUrl: typeof acc.permalinkUrl === "string" && acc.permalinkUrl.startsWith("https://soundcloud.com/") ? acc.permalinkUrl : null,
+      secret: await encryptJson(key, cookies),
+      savedAt: now,
+      lastSynced: now
+    };
+    count++;
   }
 
   if (count === 0) {
@@ -345,29 +499,34 @@ async function handleSwitchAccount(targetName) {
   isSwitching = true;
 
   try {
+    const key = await requireKey();
     const data = await chrome.storage.local.get(["sc_accounts", "sc_active_account"]);
     const accounts = data.sc_accounts || {};
     const currentActive = data.sc_active_account;
 
     // Sauvegarder les cookies frais du compte actuel si connecté
-    if (currentActive && accounts[currentActive]) {
+    if (currentActive && Object.hasOwn(accounts, currentActive)) {
       const currentCookies = await getSoundcloudCookies();
       if (hasSoundcloudAuthCookie(currentCookies)) {
-        accounts[currentActive].cookies = currentCookies;
+        accounts[currentActive].secret = await encryptJson(key, currentCookies.map(sanitizeCookie).filter(Boolean));
+        delete accounts[currentActive].cookies;
         accounts[currentActive].lastSynced = new Date().toISOString();
       }
     }
 
-    const targetAccount = accounts[targetName];
-    if (!targetAccount) {
+    const targetAccount = Object.hasOwn(accounts, targetName) ? accounts[targetName] : null;
+    if (!targetAccount?.secret) {
       throw new Error(`Le compte "${targetName}" est introuvable.`);
     }
+
+    // Déchiffrer AVANT de toucher aux cookies : un échec ne déconnecte personne.
+    const targetCookies = await decryptJson(key, targetAccount.secret);
 
     // 1. Vider les cookies existants
     await clearSoundcloudCookies();
 
     // 2. Injecter les cookies du nouveau profil
-    await setSoundcloudCookies(targetAccount.cookies);
+    await setSoundcloudCookies(targetCookies);
 
     // 3. Mettre à jour le compte actif
     await chrome.storage.local.set({
