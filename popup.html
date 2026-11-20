@@ -71,6 +71,21 @@
     </div>
   </footer>
 
+  <!-- Passphrase du coffre chiffré -->
+  <dialog id="passDialog" class="pass-dialog">
+    <form method="dialog" id="passForm">
+      <p id="passTitle" class="pass-title"></p>
+      <input type="password" id="passInput" autocomplete="current-password" required>
+      <input type="password" id="passConfirm" placeholder="Confirmer la passphrase" autocomplete="new-password" hidden>
+      <p id="passError" class="status-msg error"></p>
+      <div class="pass-actions">
+        <button type="button" id="passReset" class="btn-text">Passphrase oubliée ?</button>
+        <button value="cancel" formnovalidate class="btn btn-secondary">Annuler</button>
+        <button value="ok" class="btn btn-primary">Valider</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="popup.js"></script>
 </body>
 </html>
