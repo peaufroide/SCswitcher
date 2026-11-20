@@ -170,6 +170,39 @@ async function updateExtensionBadge() {
 }
 
 // 5. GESTION DES COOKIES
+const COOKIE_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
+const UNSAFE_COOKIE_CHARS = /[\u0000-\u001F\u007F;]/;
+const SAME_SITE_VALUES = ["no_restriction", "lax", "strict"];
+const MAX_COOKIES_PER_ACCOUNT = 100;
+
+function isSoundcloudDomain(domain) {
+  const d = String(domain).replace(/^\./, "").toLowerCase();
+  return d === "soundcloud.com" || d.endsWith(".soundcloud.com");
+}
+
+// Seul format de cookie accepté avant injection dans le navigateur : domaine
+// SoundCloud uniquement, Secure forcé, champs reconstruits (rien n'est recopié tel quel).
+function sanitizeCookie(c) {
+  if (!c || typeof c !== "object") return null;
+  if (typeof c.name !== "string" || !COOKIE_NAME_RE.test(c.name)) return null;
+  if (typeof c.value !== "string" || c.value.length > 4096 || UNSAFE_COOKIE_CHARS.test(c.value)) return null;
+  if (typeof c.domain !== "string" || !isSoundcloudDomain(c.domain)) return null;
+
+  const pathOk = typeof c.path === "string" && c.path.startsWith("/") && c.path.length <= 1024 && !UNSAFE_COOKIE_CHARS.test(c.path);
+  const cookie = {
+    name: c.name,
+    value: c.value,
+    domain: c.domain.toLowerCase(),
+    path: pathOk ? c.path : "/",
+    secure: true,
+    httpOnly: c.httpOnly === true,
+    hostOnly: c.hostOnly === true
+  };
+  if (SAME_SITE_VALUES.includes(c.sameSite)) cookie.sameSite = c.sameSite;
+  if (Number.isFinite(c.expirationDate)) cookie.expirationDate = c.expirationDate;
+  return cookie;
+}
+
 function hasSoundcloudAuthCookie(cookies) {
   if (!Array.isArray(cookies) || cookies.length === 0) return false;
   return cookies.some(c => c.name === "oauth_token" && typeof c.value === "string" && c.value.trim().length > 0);
@@ -211,35 +244,23 @@ async function clearSoundcloudCookies() {
 }
 
 async function setSoundcloudCookies(cookies) {
-  for (const cookie of cookies) {
-    const cleanDomain = cookie.domain.startsWith(".") ? cookie.domain.substring(1) : cookie.domain;
-    const protocol = cookie.secure ? "https:" : "http:";
-    const url = `${protocol}//${cleanDomain}${cookie.path}`;
+  for (const raw of cookies) {
+    const cookie = sanitizeCookie(raw);
+    if (!cookie) continue;
 
+    const host = cookie.domain.replace(/^\./, "");
     const cookieDetails = {
-      url: url,
+      url: `https://${host}${cookie.path}`,
       name: cookie.name,
       value: cookie.value,
-      path: cookie.path || "/",
-      secure: cookie.secure !== undefined ? cookie.secure : true,
-      httpOnly: Boolean(cookie.httpOnly)
+      path: cookie.path,
+      secure: true,
+      httpOnly: cookie.httpOnly
     };
 
-    if (!cookie.hostOnly && cookie.domain) {
-      cookieDetails.domain = cookie.domain;
-    }
-
-    if (cookie.storeId) {
-      cookieDetails.storeId = cookie.storeId;
-    }
-
-    if (cookie.sameSite && cookie.sameSite !== "unspecified") {
-      cookieDetails.sameSite = cookie.sameSite;
-    }
-
-    if (cookie.expirationDate) {
-      cookieDetails.expirationDate = cookie.expirationDate;
-    }
+    if (!cookie.hostOnly) cookieDetails.domain = cookie.domain;
+    if (cookie.sameSite) cookieDetails.sameSite = cookie.sameSite;
+    if (cookie.expirationDate) cookieDetails.expirationDate = cookie.expirationDate;
 
     try {
       await chrome.cookies.set(cookieDetails);
@@ -314,7 +335,16 @@ async function handleDeleteAccount(name) {
   return { success: true };
 }
 
-// Importation de comptes sauvegardés
+// Importation de comptes sauvegardés : rien n'est recopié tel quel, chaque
+// champ est validé et les cookies passent par sanitizeCookie.
+const MAX_IMPORT_ACCOUNTS = 50;
+const AVATAR_URL_RE = /^https:\/\/[a-z0-9-]+\.sndcdn\.com\//i;
+
+function cleanText(value, max) {
+  if (typeof value !== "string") return "";
+  return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, "").trim().slice(0, max);
+}
+
 async function handleImportAccounts(importedAccounts) {
   if (!importedAccounts || typeof importedAccounts !== "object") {
     return { success: false, error: "Format de fichier invalide." };
@@ -322,13 +352,26 @@ async function handleImportAccounts(importedAccounts) {
 
   const data = await chrome.storage.local.get(["sc_accounts"]);
   const existing = data.sc_accounts || {};
+  const now = new Date().toISOString();
 
   let count = 0;
-  for (const [key, acc] of Object.entries(importedAccounts)) {
-    if (acc && acc.name && Array.isArray(acc.cookies) && hasSoundcloudAuthCookie(acc.cookies)) {
-      existing[acc.name] = acc;
-      count++;
-    }
+  for (const acc of Object.values(importedAccounts).slice(0, MAX_IMPORT_ACCOUNTS)) {
+    const name = cleanText(acc?.name, 50);
+    if (!name || name === "__proto__" || !Array.isArray(acc.cookies)) continue;
+
+    const cookies = acc.cookies.slice(0, MAX_COOKIES_PER_ACCOUNT).map(sanitizeCookie).filter(Boolean);
+    if (!hasSoundcloudAuthCookie(cookies)) continue;
+
+    existing[name] = {
+      name,
+      username: cleanText(acc.username, 50) || name,
+      avatarUrl: typeof acc.avatarUrl === "string" && AVATAR_URL_RE.test(acc.avatarUrl) ? acc.avatarUrl : null,
+      permalinkUrl: typeof acc.permalinkUrl === "string" && acc.permalinkUrl.startsWith("https://soundcloud.com/") ? acc.permalinkUrl : null,
+      cookies,
+      savedAt: now,
+      lastSynced: now
+    };
+    count++;
   }
 
   if (count === 0) {
