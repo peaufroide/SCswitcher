@@ -49,6 +49,11 @@ const goodCookie = { name: "oauth_token", value: TOKEN, domain: ".soundcloud.com
 const evilCookie = { name: "x", value: "1", domain: ".evilsoundcloud.com", path: "/" };
 
 (async () => {
+  // Messages : seule la popup de l'extension est écoutée.
+  assert.strictEqual(await send({ action: "GET_VAULT_STATE" }, { id: "ext", tab: { id: 1 } }), undefined);
+  assert.strictEqual(await send({ action: "GET_VAULT_STATE" }, { id: "other" }), undefined);
+  assert.strictEqual(await send({ action: "constructor" }), undefined);
+
   // Cookies : domaine SoundCloud seulement, Secure forcé, storeId ignoré.
   assert.strictEqual(ctx.sanitizeCookie(evilCookie), null);
   assert.strictEqual(ctx.sanitizeCookie({ ...goodCookie, domain: "soundcloud.com.evil.com" }), null);
@@ -57,18 +62,41 @@ const evilCookie = { name: "x", value: "1", domain: ".evilsoundcloud.com", path:
   assert.strictEqual(clean.secure, true);
   assert.strictEqual(clean.storeId, undefined);
 
-  // Import piégé : cookies hors SoundCloud, avatar espion, __proto__.
-  const evil = JSON.parse(JSON.stringify({
-    p: { name: "__proto__", cookies: [goodCookie] },
-    e: { name: "Evil", avatarUrl: "https://attacker.example/pixel.gif", cookies: [goodCookie, evilCookie] }
-  }));
-  assert.strictEqual((await send({ action: "IMPORT_ACCOUNTS", accounts: evil })).count, 1);
-  const stored = chrome.storage.local.raw.sc_accounts.Evil;
-  assert.strictEqual(stored.avatarUrl, null);
-  assert.deepStrictEqual(stored.cookies.map((c) => c.name), ["oauth_token"]);
+  // Ancien stockage en clair -> verrouillé tant qu'aucune passphrase n'est définie.
+  await chrome.storage.local.set({ sc_accounts: { A: { name: "A", username: "a", cookies: [goodCookie] } } });
+  assert.strictEqual((await send({ action: "GET_VAULT_STATE" })).hasLegacy, true);
+  assert.strictEqual((await send({ action: "SWITCH_ACCOUNT", accountName: "A" })).error, "LOCKED");
+  assert.strictEqual((await send({ action: "UNLOCK", passphrase: "court" })).success, false);
 
+  // Création du coffre : migration, plus aucun token en clair sur "disque".
+  assert.strictEqual((await send({ action: "UNLOCK", passphrase: "correct horse" })).success, true);
+  assert.ok(!JSON.stringify(chrome.storage.local.raw).includes(TOKEN), "token en clair dans storage.local");
+  assert.strictEqual((await send({ action: "GET_VAULT_STATE" })).hasLegacy, false);
+
+  // Redémarrage navigateur (clé de session perdue) : mauvaise passphrase refusée.
+  await chrome.storage.session.remove("sc_key");
+  assert.strictEqual((await send({ action: "UNLOCK", passphrase: "wrong horse" })).error, "Passphrase incorrecte.");
+  assert.strictEqual((await send({ action: "UNLOCK", passphrase: "correct horse" })).success, true);
+
+  // Bascule : cookies déchiffrés et réinjectés en HTTPS + Secure.
+  assert.strictEqual((await send({ action: "SWITCH_ACCOUNT", accountName: "A" })).success, true);
+  const injected = setCalls.find((c) => c.name === "oauth_token");
+  assert.strictEqual(injected.value, TOKEN);
+  assert.ok(injected.secure && injected.url.startsWith("https://"));
+
+  // Import piégé (ancien format en clair) : cookies hors SoundCloud, avatar espion, __proto__.
+  const evil = JSON.parse(JSON.stringify({
+    accounts: {
+      p: { name: "__proto__", cookies: [goodCookie] },
+      e: { name: "Evil", avatarUrl: "https://attacker.example/pixel.gif", cookies: [goodCookie, evilCookie] }
+    }
+  }));
+  assert.strictEqual((await send({ action: "IMPORT_ACCOUNTS", file: evil })).count, 1);
+  setCalls.length = 0;
   await send({ action: "SWITCH_ACCOUNT", accountName: "Evil" });
-  assert.ok(setCalls.length === 1 && setCalls[0].secure && setCalls[0].url.startsWith("https://"));
+  assert.ok(setCalls.every((c) => c.url.startsWith("https://") && !c.url.includes("evil")));
+  assert.strictEqual(chrome.storage.local.raw.sc_accounts.Evil.avatarUrl, null);
+  assert.ok(!JSON.stringify(chrome.storage.local.raw).includes(TOKEN), "token en clair après import");
 
   console.log("OK : toutes les vérifications de sécurité passent");
 })().catch((e) => { console.error(e); process.exit(1); });

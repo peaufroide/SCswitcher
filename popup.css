@@ -431,3 +431,58 @@ input[type="text"]:focus {
   align-items: center;
   padding: 0 4px;
 }
+
+/* Passphrase dialog */
+.pass-dialog {
+  margin: auto;
+  width: calc(100% - 28px);
+  background-color: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.pass-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+.pass-dialog form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pass-title {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+input[type="password"] {
+  background-color: var(--bg-main);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  outline: none;
+}
+
+input[type="password"]:focus {
+  border-color: var(--accent-sc);
+  box-shadow: 0 0 0 2px rgba(255, 85, 0, 0.15);
+}
+
+.pass-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.pass-actions .btn-text {
+  margin-right: auto;
+}
+
+.pass-actions .btn-secondary {
+  flex: 0;
+}
